@@ -1,3 +1,98 @@
-            --task-definition $NEW_TD >
+            name: app-ci-cd
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Validate Docker build
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          docker build -t app:${SHA}-9226 .
+
+      - name: Warmup artifact
+        run: echo "Hello from run $GITHUB_RUN_ID – VineethGongati" > hello-9226.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-9226
+          path: hello-9226.txt
+
+  deploy:
+    needs: build-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPO: flask-app-9226
+      ECS_CLUSTER: flask-cluster-9226
+      ECS_SERVICE: flask-service-9226
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::447407243853:role/GitHubActionsECRRole-9226
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${SHA}-9226
+          docker build -t $IMAGE .
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Download current task definition
+        run: |
+          FAMILY=$(aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} --query 'services[0].taskDefinition' --output text | awk -F'/' '{print $2}' | awk -F':' '{print $1}')
+          aws ecs describe-task-definition --task-definition $FAMILY --query 'taskDefinition' > td.json
+
+      - name: Update image in task definition
+        run: |
+          jq --arg IMAGE "$IMAGE" '.containerDefinitions[0].image = $IMAGE' td.json > td-new.json
+
+      - name: Register new task definition
+        run: |
+          NEW_TD=$(aws ecs register-task-definition --cli-input-json file://td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "NEW_TD=$NEW_TD" >> $GITHUB_ENV
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition $NEW_TD \
             --force-new-deployment
           echo "Deployed $NEW_TD"
